@@ -1,0 +1,537 @@
+
+Team members- Gagan Kanojia (10002027), Kshiteej Sheth (14110068), Sanket duthade (14110042)
+
+1. Isolated the code from the opencv-contrib so that we can compile and run only the sfm module.
+
+2. Parallelized feature descriptor extraction in images using OpenMP. 
+	a. Parallelized nRobustViewMatching::computeCrossMatch written in sfm_parallel_CUDA/src/libmv_light/libmv/correspondence/nRobustViewMatching.cc
+
+3. Parallelized the reconstruction of 3D points using CUDA which includes triangulation but not bundle adjustment(since it is an iterative process). The major changes are done in the following files:
+
+	a. sfm_parallel_CUDA/src/libmv_light/libmv/simple_pipeline/pipeline.cc
+		(II) The modifications are done in the "template<typename PipelineRoutines>void InternalCompleteReconstruction". The section is marked in the file using backslashes which we have written.
+		
+	b. sfm_parallel_CUDA/src/libmv_light/libmv/simple_pipeline/intersect.cc
+		(I) Added the function "EuclideanIntersect_our"
+		
+The following files are added by us:
+	a. pipelineCUDA.cc
+		(I) Everything in it is written by us.
+	b. pipelineCUDA.cu
+		(I) kernel_EuclideanIntersect and kernel are completely written by us. SVD code is borrowed from http://svn.lirec.eu/libs/magicsquares/src/SVD.cpp
+	c. pipelineCUDA.h
+		(I) Everthing in it is written by us.
+		
+Following is the source code written by us.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+in sfm_parallel_CUDA/src/libmv_light/libmv/correspondence/nRobustViewMatching.cc
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+bool nRobustViewMatching::computeCrossMatch( const std::vector<string> & vec_data)
+{
+  if (m_pDetector == NULL || m_pDescriber == NULL)  {
+    LOG(FATAL) << "Invalid Detector or Describer.";
+    return false;
+  }
+
+  m_vec_InputNames = vec_data;
+  bool bRes = true;
+
+
+  double start = omp_get_wtime();
+  #pragma omp parallel shared(vec_data,bRes) 
+  {
+  bool bRes_local = true;
+  map<string,FeatureSet> m_viewData_local;
+  #pragma omp for schedule(static) nowait 
+  for (int i=0; i < vec_data.size(); ++i) {
+    bRes_local &= computeData(vec_data[i],m_viewData_local);
+ 
+  }
+  #pragma omp critical
+  {
+    bRes &= bRes_local;
+    for(map<string,FeatureSet>::iterator it=m_viewData_local.begin(); it!=m_viewData_local.end(); ++it){
+	    m_ViewData.insert(make_pair(it->first,it->second)); 
+    }
+  }
+}
+double end = omp_get_wtime();
+cout<<"computeData parallel time : " << (-start + end)*1000 <<endl;
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+sfm_parallel_CUDA/src/libmv_light/libmv/simple_pipeline/pipeline.cc
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+static void Intersect_our(float*data,float*R,float*t,int *valid_image,float*X, int max_track,int*valid_t,int max_image) {
+  		cout<<"call_kernel_euclidean_intersect: "<<endl;
+		call_kernel_euclidean_intersect(data,R,t,valid_image,X, max_track,valid_t,max_image);
+		printf("I am going out Intersect_our\n");
+	}
+	
+int max_track = tracks.MaxTrack()+1;
+int max_image = tracks.MaxImage()+1;
+
+//printf("max_image = %d \n",max_image);
+
+int num_resects = -1;
+int num_intersects = -1;
+int tot_resects = 0;
+LG << "Max track: " << max_track;
+LG << "Max image: " << max_image;
+LG << "Number of markers: " << tracks.NumMarkers();
+  
+int valid_image_[max_track*max_image];
+float data[max_track*2*max_image];
+int temp=0,temp2=0,temp3=0;
+vector<Mat3> R_;
+vector<Vec3> t_;    
+float t[max_image*3];
+float R[3*max_image*3];	
+float *X = new float[3*max_track];
+int *valid_t = new int[max_track];
+
+while (num_resects != 0 || num_intersects != 0){
+// Do all possible intersections.
+num_intersects = 0;
+
+for(int track=0;track<max_track;track++){
+	for(int i=0;i<max_image;i++){
+		valid_image_[track*max_image+i] = 0;	   
+	}
+	if (reconstruction->PointForTrack(track)) {
+		continue;
+	}
+	vector<Marker> all_markers = tracks.MarkersForTrack(track);
+	for (int i = 0; i < all_markers.size(); ++i) {
+		if (reconstruction->CameraForImage(all_markers[i].image)) {
+			valid_image_[track*max_image+all_markers[i].image] = 1;
+    	}
+	}
+	//valid_image_[track*max_image+max_image] = track;
+}
+
+double start = omp_get_wtime();
+cout<<"populate the data matrix begin : "<<endl;
+//populate the data matrix
+
+for(temp =0;temp<max_track;temp++){
+	vector<Marker> temp_markers = tracks.MarkersForTrack(temp);
+	for(temp2 = 0; temp2<max_image;temp2++){
+      if (valid_image_[temp*max_image+temp2]==1){
+      		//change here
+      		data[temp*2*max_image + 2*temp2] = (float)temp_markers[temp2].x;
+      		data[temp*2*max_image + 2*temp2+1] = (float)temp_markers[temp2].y;
+      }
+      
+      else {
+      		//change here
+      		data[temp*2*max_image + 2*temp2] = -999;
+      		data[temp*2*max_image + 2*temp2+1] = -999;
+      }
+	
+	}
+
+}
+double end = omp_get_wtime();
+cout<<"populate the data matrix : " << (-start + end)*1000 <<endl;
+
+vector<typename PipelineRoutines::Camera> cameras = reconstruction->cameras_;
+
+// loop to populate R and t
+for(temp=0;temp<max_image;temp++){
+	if(reconstruction->CameraForImage(temp)){
+		Vec3 temp_t = cameras[temp].t;
+		Mat3 temp_R = cameras[temp].R;
+	    for(temp2=0;temp2<3;temp2++){
+	    	//change here
+	    	t[temp*3+temp2] = (float)temp_t[temp2];
+	        for(temp3=0;temp3<3;temp3++){
+	        	//change here
+	        	//R[(3*temp + temp3)*3+temp2] = (float)temp_R(temp3,temp2);
+	        	R[(3*temp + temp2)*3+temp3] = (float)temp_R(temp2,temp3);
+	        }
+        }
+    }
+    else{
+	    for(temp2=0;temp2<3;temp2++){
+	    	//change here
+	    	t[temp*3+temp2] = 0;
+	        for(temp3=0;temp3<3;temp3++){
+	        	//change here
+	        	//R[(3*temp + temp3)*3+temp2] = 0;    	                    
+	        	R[(3*temp + temp2)*3+temp3] = 0;
+		    }    
+		}
+	}
+}
+
+
+//create the 3d point matrix here
+
+//float X[3*max_track];
+//int valid_t[max_track];
+
+
+for(temp = 0; temp<max_track;temp++){
+	valid_t[temp]=-1;
+}
+for(temp = 0; temp<3*max_track;temp++){
+	X[temp]=0;
+}
+//size_t size =   
+
+
+// KERNAL CALL
+//cout<<"Entering Intersect_our: "<<endl;
+printf("max_track = %d\n",max_track);
+PipelineRoutines::Intersect_our(data,R,t,valid_image_,X, max_track,valid_t,max_image);
+
+
+
+int num_intersects=0;
+typename PipelineRoutines::Point temp_p;
+for(temp = 0; temp<max_track;temp++){
+	if(valid_t[temp]!=-1){
+	
+		vector<Marker> all_markers = tracks.MarkersForTrack(valid_t[temp]);
+
+		vector<Marker> reconstructed_markers;
+		for (int i = 0; i < all_markers.size(); ++i) {
+			if (reconstruction->CameraForImage(all_markers[i].image)) {
+				reconstructed_markers.push_back(all_markers[i]);
+			}
+		}
+	
+		Vec3 point(X[3*valid_t[temp]+0],X[3*valid_t[temp]+1],X[3*valid_t[temp]+2]);
+
+		if (PipelineRoutines::Intersect(valid_t[temp],point,
+	                                    reconstruction,reconstructed_markers)) {
+	      num_intersects++;
+	      //LG << "Ran Intersect() for track " << temp;
+	    }
+
+	//reconstruction->InsertPoint(valid_t[temp], XX);
+	//reconstruction->InsertPoint(1,point);
+	}
+}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+sfm_parallel_CUDA/src/libmv_light/libmv/simple_pipeline/pipelineCUDA.cc
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+#include "libmv/simple_pipeline/pipelineCUDA.h"
+
+namespace libmv {
+
+void call_kernel_euclidean_intersect(float *data,float *R,float *t,int *valid_images,float *X, int max_track,int*valid_t, int max_image){
+
+	printf("I am in call_kernel_euclidean_intersect\n");
+
+	kernel(data,R,t,valid_images,X,max_track,valid_t,max_image);
+	
+	printf("I am going out call_kernel_euclidean_intersect\n");
+}
+
+}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+sfm_parallel_CUDA/src/libmv_light/libmv/simple_pipeline/pipelineCUDA.h
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+#ifndef LIBMV_SIMPLE_PIPELINE_PIPELINECUDA_H_
+#define LIBMV_SIMPLE_PIPELINE_PIPELINECUDA_H_
+
+#include <stdio.h>
+
+using namespace std;
+
+namespace libmv {
+
+void call_kernel_euclidean_intersect(float *data,float *R,float *t,int *valid_images,float *X, int max_track,int*valid_t, int max_image);
+
+void kernel(float *data,float *R,float *t,int *valid_image,float *X, int max_track,int* valid_t,int max_image);
+
+}  // namespace libmv
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+sfm_parallel_CUDA/src/libmv_light/libmv/simple_pipeline/pipelineCUDA.cu
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+__global__ void kernel_EuclideanIntersect(float*data_mat,float*R,float*t, int *valid_image,float *X, int max_track,int*valid_t,int max_image){
+    
+//  float X,Y,Z;
+	//const int valid_images = valid_image;
+	//const int max_track = max_track_;        
+    
+    int tidx = threadIdx.x + blockIdx.x * blockDim.x;
+
+	if(tidx<max_track){
+	
+		int i,j,k,z,valid_images=0,count;
+		int* track_images = new int[max_image];
+		
+		for(i=0;i<max_image;i++){
+			if(valid_image[tidx*max_image + i]==1){
+		    	track_images[i] = i;
+			} else {
+				track_images[i] =-1;
+			}
+			valid_images+=valid_image[tidx*max_image + i];
+			//if(tidx==1){
+				//printf("i = %d \n",i);
+			//}	
+		}
+	
+			//printf("oo");
+		if(valid_images>1){
+	
+		 	if(tidx==769){
+				printf("valid_images = %d \n",valid_images);
+			}
+		
+			float *x_ = new float[valid_images];
+			float *y_ = new float[valid_images];
+	
+			//printf("I am in kernel 1\n");
+
+			//populate the 2d point arrays
+			count=0;
+			for(i=0;i<max_image;i++){
+				if(track_images[i]!=-1){
+				//printf("%f \n",data_mat[tidx*max_image*2 + 2*track_images[i]]);
+				x_[count] = data_mat[tidx*max_image*2 + 2*track_images[i]];
+				y_[count] = data_mat[tidx*max_image*2 + 2*track_images[i]+1];
+				count++;
+				}
+			}
+			if(tidx==769){
+				printf("count = %d \n",count);
+			}
+	
+	
+			float ***P = new float**[valid_images];
+			for(int ii=0;ii<valid_images;ii++){
+				P[ii] = new float*[3];
+				for(int jj=0;jj<3;jj++){
+					P[ii][jj] = new float[4];
+				}
+			}
+	
+			//printf("I am in kernel 3\n");
+			count=0;
+			for(k=0;k<max_image;k++){
+				if(track_images[k]!=-1){
+					for(i=0;i<3;i++){
+						P[count][i][3] = t[track_images[k]*3 + i];
+							for(j=0;j<3;j++){
+								//P[count][i][j] = R[track_images[k]*3*3 + i*3 + j];
+								P[count][i][j] = R[(3*track_images[k] + i)*3+j];					
+									}
+					}
+				count++;
+				}
+			}
+			if(tidx==769){
+				printf("count = %d \n",count);
+			}
+
+			count=0;	
+			//N view triangulation
+			float sum;
+			//float equation_matrix[2*valid_images][4];
+			//printf("I am in kernel 4\n");
+			float **equation_matrix = new float*[2*valid_images];
+
+		
+			for(int ii=0;ii<valid_images;ii++){
+				equation_matrix[2*ii]= new float[4];
+				equation_matrix[2*ii + 1]= new float[4];
+					  
+				for(int jj=0;jj<4;jj++){
+					equation_matrix[2*ii][jj] = 0;
+					equation_matrix[2*ii + 1][jj] = 0;			
+					 
+					//printf("%f \n",equation_matrix[2*ii][jj]);
+				}
+			}
+
+			  float skew[2][3];   
+			  skew[0][0] = 0;
+			  //printf("%d \n",skew[0][0]);
+			  skew[0][1] = -1;
+			  //printf("%d \n",skew[0][1]);
+			  skew[1][0] = 1;
+			  //printf("%d \n",skew[1][0]);	  
+			  skew[1][1] = 0;
+			  
+			for (i = 0; i < valid_images; i++) {
+				//if(tidx==769){
+					//printf("I am in 769\n");
+					//printf("Y_i = %f \n",y_[i]);
+				//}
+				skew[0][2] = y_[i]; 
+				//skew[0][2] = 2;
+				skew[1][2] = -1*x_[i];
+				//skew[1][2] = 1;
+		//		{{0,-1,y_[i]},{1,0,-x_[i]}};
+		//multiply skew and P[i] and store it in the ith (2,4) sized block 
+			  for(j= 0;j<2;j++){
+			  	for(k = 0;k<4;k++){
+					sum = 0;
+			  		for(z = 0;z<3;z++){
+			  			//printf("j =%d k = %d z = %d\n",j,k,z);
+			  			sum+=skew[j][z]*P[i][z][k];
+			  		}
+			  		equation_matrix[i*2+j][k] = sum;
+			  	}
+			  }
+			}
+			//delete[] x_,y_;
+			//printf("I am in kernel 6\n");
+			/*
+		* Input to dsvd is as follows:
+		 *   a = mxn matrix to be decomposed, gets overwritten with u
+		 *   m = row dimension of a
+		 *   n = column dimension of a
+		 *   w = returns the vector of singular values of a
+		 *   v = returns the right orthogonal transformation matrix
+		 */
+
+			//float w[4];
+			//float v[4*4];
+			float *w = new float[4];
+			float *v = new float[4*4];
+
+			float *equation_matrix_linear = new float[2*valid_images*4];
+
+			for(int ii=0;ii<2*valid_images;ii++){
+				for(int jj=0;jj<4;jj++){
+					equation_matrix_linear[ii*4+jj] = equation_matrix[ii][jj];
+					/*if(tidx == 769){			
+					printf("%f \n",equation_matrix[ii][jj]);}*/
+				}
+			}
+
+		if(dsvd(equation_matrix_linear,2*valid_images,4,w,v) ==1){
+		  //svd iteration was successful
+		  //printf("I am in kernel 8\n");
+		  for(i=0;i<3;i++){
+		  	if(v[3*4+3]!=0){
+		  		X[3*tidx + i] = v[i*4+3]/v[3*4+3] ;
+		  		//X[3*tidx + i] = v[3*4+i];
+		  		valid_t[tidx] = tidx;
+		  	} else{
+		  		X[3*tidx + i] = 0;
+		  		valid_t[tidx] = -1;
+		  	} 
+		  }
+		  }
+		  else{
+		  for(i=0;i<3;i++){
+		  	X[3*tidx + i] = 0 ;  
+		  }
+		 valid_t[tidx] = -1;  
+		  }
+		  //
+		delete[] equation_matrix_linear,w,v;
+		for(int ii=0;ii<valid_images;ii++){
+				delete[] equation_matrix[2*ii];
+				delete[] equation_matrix[2*ii + 1];
+			}
+		delete[] equation_matrix;
+		for(int ii=0;ii<valid_images;ii++){
+			for(int jj=0;jj<3;jj++){
+				delete[] P[ii][jj];
+			}
+		}
+		for(int ii=0;ii<valid_images;ii++){
+				delete[] P[ii];
+		}
+		delete[] P;
+
+		//
+	}
+	else{
+
+	  for(int i=0;i<3;i++){
+	  	X[3*tidx + i] = 0 ;  
+	  }
+	 valid_t[tidx] = -1;
+	}
+}
+
+}
+
+
+void kernel(float *data,float *R,float *t, int *valid_image,float *X, int max_track,int*valid_t,int max_image){
+	
+	/*int count =0;
+	for(int ii = 0; ii<max_track*2*max_image;ii++){
+    		//printf("t = %f \t",data[ii]);
+    		count = count+1;
+	}
+	printf("count = %d\n",count);*/
+	
+
+
+	//copy data,R and t to the gpu
+	float *d_data,*d_X;
+	float *d_t, *d_R ;
+	int *d_valid_t,*d_valid_image;
+
+	 size_t dataSize = sizeof(float) * size_t(max_track*2*max_image);
+//	printf("%d", (int)dataSize-max_track*2*max_image);
+	 size_t tSize = sizeof(float) * size_t(max_image*3);
+	 size_t RSize = sizeof(float) * size_t(3*max_image*3);
+	 size_t XSize = sizeof(float) * size_t(3*max_track);
+	 size_t valid_size = sizeof(int) * size_t(max_track);
+	 size_t valid_image_size = sizeof(int) * size_t(max_image*max_track);
+
+	 
+	cudaMalloc((void **)&d_data, dataSize);
+	cudaMalloc((void **)&d_t, tSize);
+	cudaMalloc((void **)&d_R, RSize);
+	cudaMalloc((void **)&d_X, XSize);
+	cudaMalloc((void **)&d_valid_t, valid_size);
+	cudaMalloc((void **)&d_valid_image, valid_image_size);	
+	cudaMemcpy(d_data, data, dataSize, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_t, t, tSize, cudaMemcpyHostToDevice); 
+	cudaMemcpy(d_R, R, RSize, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_valid_image, valid_image, valid_image_size, cudaMemcpyHostToDevice);	
+	cudaMemcpy(d_X, X, XSize, cudaMemcpyHostToDevice); 
+	cudaMemcpy(d_valid_t, valid_t, valid_size, cudaMemcpyHostToDevice);
+	
+	dim3 threadsPerBlock(512);
+	int x = (max_track+threadsPerBlock.x-1)/threadsPerBlock.x;
+	dim3 numBlock(x);
+
+
+	kernel_EuclideanIntersect<<<numBlock,threadsPerBlock>>>(d_data,d_R,d_t,d_valid_image,d_X,max_track,d_valid_t,max_image);
+
+	cudaDeviceSynchronize();
+	cudaError_t error = cudaGetLastError();
+	if (error != cudaSuccess) {
+	  fprintf(stderr, "ERROR IN KERNEL: %s \n", cudaGetErrorString(error));
+	}
+	cudaMemcpy(X, d_X, XSize, cudaMemcpyDeviceToHost);
+	cudaMemcpy(valid_t, d_valid_t, valid_size, cudaMemcpyDeviceToHost);
+
+	cudaFree(d_data);cudaFree(d_t);cudaFree(d_R);cudaFree(d_X);cudaFree(d_valid_t);
+}
+}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+sfm_parallel_CUDA/src/libmv_light/libmv/simple_pipeline/intersect.cc
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+bool EuclideanIntersect_our(int track,Vec3 &X,
+                        EuclideanReconstruction *reconstruction,const vector<Marker> &markers) {
+	
+  reconstruction->InsertPoint(track, X);
+
+  // TODO(keir): Add proper error checking.
+  return true;
+}
+
+

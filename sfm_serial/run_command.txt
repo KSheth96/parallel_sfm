@@ -1,0 +1,4 @@
+./foo /home/vision/Desktop/Gagan/Final_submission/sfm_parallel_CUDA/samples/data/images/dataset_files.txt 350 240 360
+./foo /home/vision/Desktop/Gagan/Final_submission/sfm_parallel_OPENMP/samples/data/images/dataset_files.txt 350 240 360
+./foo /home/vision/Desktop/Gagan/Final_submission/sfm_serial/samples/data/images/dataset_files.txt 350 240 360
+
