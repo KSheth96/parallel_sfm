@@ -7,6 +7,7 @@ The serial implementation of structure-from-motion (sfm) is borrowed from the op
 ### Updates:
 
 1. Parallelized feature descriptor extraction in images using OpenMP. More precisely, parallelized `nRobustViewMatching::computeCrossMatch` written in `parallel_sfm/src/libmv_light/libmv/correspondence/nRobustViewMatching.cc`
+2. Euclidean triangulation kernel written in cuda is available in parallel_sfm/src/libmv_light/libmv/simple_pipeline/pipelineCUDA.cu`
 
 #Installation
 
